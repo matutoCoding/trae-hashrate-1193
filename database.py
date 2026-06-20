@@ -713,6 +713,27 @@ class ScheduleManager:
         row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_today_appointments(self) -> List[Dict]:
+        """获取今日已预约列表，附带队列取号状态"""
+        today = date.today().isoformat()
+        cursor = self.db.execute('''
+            SELECT s.id as schedule_id, s.patient_id, s.schedule_date, 
+                   s.start_time, s.end_time, s.status as schedule_status,
+                   s.patient_type, s.chair_id,
+                   p.name as patient_name, p.phone as patient_phone,
+                   c.name as chair_name,
+                   q.id as queue_id, q.queue_number, q.status as queue_status,
+                   q.is_jumped
+            FROM schedules s
+            LEFT JOIN patients p ON s.patient_id = p.id
+            LEFT JOIN chairs c ON s.chair_id = c.id
+            LEFT JOIN queue q ON q.schedule_id = s.id 
+                AND DATE(q.checkin_time) = DATE('now')
+            WHERE s.schedule_date = ? AND s.status = 'booked'
+            ORDER BY s.start_time, s.chair_id
+        ''', (today,))
+        return [dict(row) for row in cursor.fetchall()]
+
     def get_available_slots(self, schedule_date: date, chair_id: Optional[int] = None) -> List[Dict]:
         sql = '''
             SELECT s.*, c.name as chair_name
@@ -745,32 +766,45 @@ class ScheduleManager:
         ''', (today.isoformat(), end_date.isoformat()))
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_dedup_logs(self, days: int = 30, chair_id: Optional[int] = None) -> List[Dict]:
-        """获取去重合并日志记录"""
-        end_date = date.today()
-        start_date = end_date - timedelta(days=days)
+    def get_dedup_logs(self, start_date: Optional[date] = None, 
+                       end_date: Optional[date] = None,
+                       chair_id: Optional[int] = None,
+                       patient_name: Optional[str] = None) -> List[Dict]:
+        """获取去重合并日志记录，支持日期范围、诊疗椅、患者姓名筛选"""
+        if not end_date:
+            end_date = date.today()
+        if not start_date:
+            start_date = end_date - timedelta(days=30)
         
         sql = '''
             SELECT l.*, c.name as chair_name, p.name as patient_name
             FROM schedule_dedup_log l
             LEFT JOIN chairs c ON l.chair_id = c.id
             LEFT JOIN patients p ON l.kept_patient_id = p.id
-            WHERE l.merge_time >= ?
+            WHERE DATE(l.merge_time) >= ? AND DATE(l.merge_time) <= ?
         '''
-        params = [start_date.isoformat()]
+        params = [start_date.isoformat(), end_date.isoformat()]
         
         if chair_id:
             sql += " AND l.chair_id = ?"
             params.append(chair_id)
         
+        if patient_name and patient_name.strip():
+            sql += " AND (p.name LIKE ? OR l.detail LIKE ?)"
+            search = f"%{patient_name.strip()}%"
+            params.extend([search, search])
+        
         sql += " ORDER BY l.merge_time DESC, l.id DESC"
         cursor = self.db.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
-    def get_dedup_summary(self, days: int = 30) -> Dict:
+    def get_dedup_summary(self, start_date: Optional[date] = None,
+                          end_date: Optional[date] = None) -> Dict:
         """获取去重合并统计摘要"""
-        end_date = date.today()
-        start_date = end_date - timedelta(days=days)
+        if not end_date:
+            end_date = date.today()
+        if not start_date:
+            start_date = end_date - timedelta(days=30)
         
         cursor = self.db.execute('''
             SELECT 
@@ -778,10 +812,12 @@ class ScheduleManager:
                 COALESCE(SUM(merged_count), 0) as total_merged,
                 COALESCE(SUM(CASE WHEN kept_patient_id IS NOT NULL THEN 1 ELSE 0 END), 0) as kept_patient_count
             FROM schedule_dedup_log
-            WHERE merge_time >= ?
-        ''', (start_date.isoformat(),))
+            WHERE DATE(merge_time) >= ? AND DATE(merge_time) <= ?
+        ''', (start_date.isoformat(), end_date.isoformat()))
         result = dict(cursor.fetchone())
-        result['days'] = days
+        result['start_date'] = start_date.isoformat()
+        result['end_date'] = end_date.isoformat()
+        result['days'] = (end_date - start_date).days + 1
         return result
 
 
@@ -867,11 +903,20 @@ class QueueManager:
         return None
 
     def complete_queue(self, queue_id: int):
+        cursor = self.db.execute("SELECT schedule_id FROM queue WHERE id=?", (queue_id,))
+        row = cursor.fetchone()
+        
         self.db.execute('''
             UPDATE queue 
             SET status='completed', completed_time=CURRENT_TIMESTAMP
             WHERE id=?
         ''', (queue_id,))
+        
+        if row and row['schedule_id']:
+            self.db.execute('''
+                UPDATE schedules SET status='completed' WHERE id=?
+            ''', (row['schedule_id'],))
+        
         self.db.commit()
 
     def cancel_queue(self, queue_id: int):

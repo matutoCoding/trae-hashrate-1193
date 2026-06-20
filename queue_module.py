@@ -383,6 +383,7 @@ class QueueModule(QWidget):
         
         self.tabs = QTabWidget()
         self.tabs.addTab(self.create_queue_tab(), "排队叫号")
+        self.tabs.addTab(self.create_appointment_tab(), "今日预约")
         self.tabs.addTab(self.create_jump_tab(), "优先插队")
         self.tabs.addTab(self.create_overview_tab(), "队列总览")
         self.tabs.addTab(self.create_history_tab(), "今日记录")
@@ -622,6 +623,15 @@ class QueueModule(QWidget):
         self.ov_cancelled_card = self._create_stat_card("已取消", "0", "#9E9E9E", "cancelled")
         self.ov_total_card = self._create_stat_card("总取号", "0", "#673AB7", "total")
         
+        self._ov_stat_cards = {
+            'waiting': self.ov_waiting_card,
+            'called': self.ov_called_card,
+            'completed': self.ov_completed_card,
+            'cancelled': self.ov_cancelled_card,
+            'total': self.ov_total_card,
+        }
+        self._current_ov_card = None
+        
         summary_layout.addWidget(self.ov_waiting_card)
         summary_layout.addWidget(self.ov_called_card)
         summary_layout.addWidget(self.ov_completed_card)
@@ -703,32 +713,26 @@ class QueueModule(QWidget):
     def _create_stat_card(self, title, value, color, status_key):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
-        card.setStyleSheet(f"""
-            QFrame {{
-                border: 2px solid {color};
-                border-radius: 8px;
-                background-color: white;
-                padding: 10px;
-            }}
-            QFrame:hover {{
-                background-color: #f5f5f5;
-            }}
-        """)
+        card.setProperty("card_color", color)
         card.setProperty("status_key", status_key)
         card.setCursor(Qt.PointingHandCursor)
+        card.setObjectName(f"stat_card_{status_key}")
+        
+        self._update_card_style(card, color, selected=False)
         
         layout = QVBoxLayout()
         layout.setSpacing(5)
         
         title_label = QLabel(title)
         title_label.setAlignment(Qt.AlignCenter)
+        title_label.setObjectName("card_title")
         title_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
         layout.addWidget(title_label)
         
         value_label = QLabel(value)
         value_label.setAlignment(Qt.AlignCenter)
+        value_label.setObjectName("card_value")
         value_label.setStyleSheet(f"color: {color}; font-size: 28px; font-weight: bold;")
-        value_label.setProperty("card_value", True)
         layout.addWidget(value_label)
         
         card.setLayout(layout)
@@ -736,9 +740,34 @@ class QueueModule(QWidget):
         
         return card
     
+    def _update_card_style(self, card, color, selected=False):
+        if selected:
+            card.setStyleSheet(f"""
+                QFrame#stat_card_{card.property('status_key')} {{
+                    border: 3px solid {color};
+                    border-radius: 8px;
+                    background-color: {color}20;
+                    padding: 10px;
+                }}
+            """)
+        else:
+            card.setStyleSheet(f"""
+                QFrame#stat_card_{card.property('status_key')} {{
+                    border: 2px solid {color};
+                    border-radius: 8px;
+                    background-color: white;
+                    padding: 10px;
+                }}
+                QFrame#stat_card_{card.property('status_key')}:hover {{
+                    background-color: #f5f5f5;
+                }}
+            """)
+    
     def on_tab_changed(self, index):
         tab_name = self.tabs.tabText(index)
-        if tab_name == "队列总览":
+        if tab_name == "今日预约":
+            self.load_appointments()
+        elif tab_name == "队列总览":
             self.refresh_overview()
         elif tab_name == "今日记录":
             self.load_history()
@@ -746,9 +775,19 @@ class QueueModule(QWidget):
     def on_stat_card_clicked(self, status_key):
         if status_key == 'total':
             self._current_ov_status = None
+            self._current_ov_card = 'total'
         else:
             self._current_ov_status = status_key
+            self._current_ov_card = status_key
+        
+        self._update_all_card_selection()
         self.refresh_overview_details()
+    
+    def _update_all_card_selection(self):
+        for key, card in self._ov_stat_cards.items():
+            color = card.property("card_color")
+            is_selected = (key == self._current_ov_card)
+            self._update_card_style(card, color, is_selected)
     
     def on_chair_stat_clicked(self, row, col):
         if col == 0:
@@ -782,6 +821,8 @@ class QueueModule(QWidget):
         self._current_ov_chair = None
         self._current_ov_type = None
         self._current_ov_status = None
+        self._current_ov_card = None
+        self._update_all_card_selection()
         self.refresh_overview()
     
     def refresh_overview(self):
@@ -795,16 +836,9 @@ class QueueModule(QWidget):
     
     def _refresh_overview_summary(self):
         stats = queue_manager.get_queue_stats()
-        status_labels = {
-            'waiting': ('等待中', self.ov_waiting_card),
-            'called': ('已叫号', self.ov_called_card),
-            'completed': ('已完成', self.ov_completed_card),
-            'cancelled': ('已取消', self.ov_cancelled_card),
-            'total': ('总取号', self.ov_total_card),
-        }
-        for key, (_, card) in status_labels.items():
+        for key, card in self._ov_stat_cards.items():
             value = stats.get(key, 0)
-            value_label = card.findChild(QLabel, "", Qt.FindDirectChildrenOnly)
+            value_label = card.findChild(QLabel, "card_value")
             if value_label:
                 value_label.setText(str(value))
     
@@ -921,6 +955,198 @@ class QueueModule(QWidget):
                 cell_item = self.ov_detail_table.item(row, col)
                 if cell_item:
                     cell_item.setTextAlignment(Qt.AlignCenter)
+    
+    def create_appointment_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        filter_layout = QHBoxLayout()
+        
+        filter_layout.addWidget(QLabel("诊疗椅:"))
+        self.appt_chair_filter = QComboBox()
+        self.appt_chair_filter.addItem("全部", None)
+        chairs = chair_manager.get_all_chairs()
+        for chair in chairs:
+            self.appt_chair_filter.addItem(chair['name'], chair['id'])
+        filter_layout.addWidget(self.appt_chair_filter)
+        
+        filter_layout.addWidget(QLabel("状态:"))
+        self.appt_status_filter = QComboBox()
+        self.appt_status_filter.addItem("全部", None)
+        self.appt_status_filter.addItem("待取号", "waiting_checkin")
+        self.appt_status_filter.addItem("已取号", "checked_in")
+        filter_layout.addWidget(self.appt_status_filter)
+        
+        self.refresh_appt_btn = QPushButton("刷新")
+        self.refresh_appt_btn.clicked.connect(self.load_appointments)
+        filter_layout.addWidget(self.refresh_appt_btn)
+        filter_layout.addStretch()
+        
+        layout.addLayout(filter_layout)
+        
+        self.appt_summary_label = QLabel("今日共 0 个预约，其中待取号 0 个，已取号 0 个")
+        self.appt_summary_label.setStyleSheet("padding: 6px; font-weight: bold; color: #1976D2;")
+        layout.addWidget(self.appt_summary_label)
+        
+        self.appt_table = QTableWidget()
+        self.appt_table.setColumnCount(8)
+        self.appt_table.setHorizontalHeaderLabels([
+            "预约时间", "患者姓名", "联系电话", "诊疗椅", 
+            "患者类型", "取号状态", "队列号码", "操作"
+        ])
+        self.appt_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.appt_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.appt_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.appt_table.setAlternatingRowColors(True)
+        layout.addWidget(self.appt_table, 1)
+        
+        hint_label = QLabel("提示：点击\"取号\"按钮可直接为预约患者办理取号，取号后号码与预约记录自动关联")
+        hint_label.setStyleSheet("color: #888; padding: 4px;")
+        layout.addWidget(hint_label)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def load_appointments(self):
+        try:
+            appointments = schedule_manager.get_today_appointments()
+            
+            chair_id = self.appt_chair_filter.currentData()
+            status_filter = self.appt_status_filter.currentData()
+            
+            if chair_id:
+                appointments = [a for a in appointments if a['chair_id'] == chair_id]
+            
+            if status_filter == 'waiting_checkin':
+                appointments = [a for a in appointments if not a['queue_id']]
+            elif status_filter == 'checked_in':
+                appointments = [a for a in appointments if a['queue_id']]
+            
+            waiting_count = sum(1 for a in appointments if not a['queue_id'])
+            checked_count = sum(1 for a in appointments if a['queue_id'])
+            self.appt_summary_label.setText(
+                f"今日共 {len(appointments)} 个预约，其中待取号 {waiting_count} 个，已取号 {checked_count} 个"
+            )
+            
+            self.appt_table.setRowCount(0)
+            
+            type_names = {
+                'emergency': '急诊',
+                'vip': 'VIP贵宾',
+                'priority': '复诊优先',
+                'normal': '普通患者',
+            }
+            
+            for appt in appointments:
+                row = self.appt_table.rowCount()
+                self.appt_table.insertRow(row)
+                
+                time_range = f"{appt['start_time']} - {appt['end_time']}"
+                self.appt_table.setItem(row, 0, QTableWidgetItem(time_range))
+                self.appt_table.setItem(row, 1, QTableWidgetItem(appt.get('patient_name', '')))
+                self.appt_table.setItem(row, 2, QTableWidgetItem(appt.get('patient_phone', '')))
+                self.appt_table.setItem(row, 3, QTableWidgetItem(appt.get('chair_name', '')))
+                
+                type_name = type_names.get(appt.get('patient_type', 'normal'), '普通患者')
+                self.appt_table.setItem(row, 4, QTableWidgetItem(type_name))
+                
+                if appt['queue_id']:
+                    status_text = "已取号"
+                    queue_num = f"#{appt['queue_number']}"
+                    if appt.get('is_jumped'):
+                        queue_num += " (插队)"
+                else:
+                    status_text = "待取号"
+                    queue_num = "-"
+                
+                status_item = QTableWidgetItem(status_text)
+                status_item.setTextAlignment(Qt.AlignCenter)
+                if appt['queue_id']:
+                    status_item.setForeground(QBrush(QColor('#4CAF50')))
+                else:
+                    status_item.setForeground(QBrush(QColor('#FF9800')))
+                self.appt_table.setItem(row, 5, status_item)
+                
+                num_item = QTableWidgetItem(queue_num)
+                num_item.setTextAlignment(Qt.AlignCenter)
+                self.appt_table.setItem(row, 6, num_item)
+                
+                btn_widget = QWidget()
+                btn_layout = QHBoxLayout()
+                btn_layout.setContentsMargins(2, 2, 2, 2)
+                
+                if appt['queue_id']:
+                    btn = QPushButton("查看详情")
+                    btn.setStyleSheet("background-color: #2196F3; color: white; padding: 4px 12px;")
+                    btn.clicked.connect(lambda _, qid=appt['queue_id']: self.show_queue_detail(qid))
+                else:
+                    btn = QPushButton("取号")
+                    btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 4px 12px;")
+                    btn.clicked.connect(lambda _, sid=appt['schedule_id'], 
+                                              pid=appt['patient_id'],
+                                              cid=appt['chair_id'],
+                                              ptype=appt.get('patient_type', 'normal'): 
+                                        self.checkin_from_appointment(sid, pid, cid, ptype))
+                btn_layout.addStretch()
+                btn_layout.addWidget(btn)
+                btn_layout.addStretch()
+                btn_widget.setLayout(btn_layout)
+                self.appt_table.setCellWidget(row, 7, btn_widget)
+                
+                for col in range(7):
+                    item = self.appt_table.item(row, col)
+                    if item and col != 1 and col != 2:
+                        item.setTextAlignment(Qt.AlignCenter)
+        except Exception as e:
+            print(f"加载今日预约出错: {e}")
+    
+    def checkin_from_appointment(self, schedule_id, patient_id, chair_id, patient_type):
+        try:
+            result = queue_manager.add_to_queue(
+                patient_id=patient_id,
+                schedule_id=schedule_id,
+                chair_id=chair_id,
+                patient_type=patient_type,
+                is_jump=False
+            )
+            
+            QMessageBox.information(self, "取号成功", 
+                f"患者取号成功！\n\n队列号码: #{result['queue_number']}\n患者类型: {patient_type}")
+            
+            self.load_appointments()
+            self.load_queue()
+            self.load_history()
+        except Exception as e:
+            QMessageBox.critical(self, "取号失败", f"取号失败: {str(e)}")
+    
+    def show_queue_detail(self, queue_id):
+        try:
+            item = queue_manager.get_queue_item(queue_id)
+            if not item:
+                return
+            
+            status_names = {'waiting': '等待中', 'called': '已叫号', 
+                          'completed': '已完成', 'cancelled': '已取消'}
+            
+            msg = (
+                f"队列详情\n\n"
+                f"号码: #{item['queue_number']}\n"
+                f"患者: {item.get('patient_name', '')}\n"
+                f"状态: {status_names.get(item['status'], item['status'])}\n"
+                f"优先级: {item['priority']}\n"
+                f"签到时间: {item.get('checkin_time', '')[:19]}\n"
+            )
+            
+            if item.get('called_time'):
+                msg += f"叫号时间: {item['called_time'][:19]}\n"
+            if item.get('completed_time'):
+                msg += f"完成时间: {item['completed_time'][:19]}\n"
+            if item.get('is_jumped'):
+                msg += f"\n该患者为插队优先叫号\n"
+            
+            QMessageBox.information(self, "队列详情", msg)
+        except Exception as e:
+            print(f"显示队列详情出错: {e}")
     
     def create_history_tab(self):
         widget = QWidget()
