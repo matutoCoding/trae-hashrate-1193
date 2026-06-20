@@ -770,14 +770,21 @@ class CycleModule(QWidget):
                 
                 progress.setValue(100)
                 
-                skip_count = total_count - added_count
-                if skip_count > 0:
-                    msg = f"排期生成完成！\n\n新增排期: {added_count} 个\n已存在跳过: {skip_count} 个\n总时段数: {total_count} 个"
-                else:
-                    msg = f"成功生成 {added_count} 个时段的排期"
-                QMessageBox.information(self, "完成", msg)
                 self.load_calendar()
                 self.load_schedule_list()
+                
+                skip_count = total_count - added_count
+                msg_lines = [
+                    "排期生成完成！",
+                    "",
+                    f"本次操作时段总数: {total_count} 个",
+                    f"实际新增到排期表: {added_count} 个",
+                    f"已存在（自动跳过，未重复插入）: {skip_count} 个",
+                ]
+                if data['patient_id']:
+                    msg_lines.append("")
+                    msg_lines.append("注意：每位患者每天只占用一个时段")
+                QMessageBox.information(self, "完成", "\n".join(msg_lines))
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"生成排期失败: {str(e)}")
             finally:
@@ -809,14 +816,18 @@ class CycleModule(QWidget):
                 
                 progress.setValue(100)
                 
-                skip_count = total_count - added_count
-                if skip_count > 0:
-                    msg = f"空时段生成完成！\n\n新增空时段: {added_count} 个\n已存在跳过: {skip_count} 个\n总时段数: {total_count} 个"
-                else:
-                    msg = f"成功生成 {added_count} 个空时段"
-                QMessageBox.information(self, "完成", msg)
                 self.load_batch_results()
                 self.load_calendar()
+                
+                skip_count = total_count - added_count
+                msg_lines = [
+                    "空时段生成完成！",
+                    "",
+                    f"本次操作时段总数: {total_count} 个",
+                    f"实际新增到排期表: {added_count} 个",
+                    f"已存在（自动跳过，未重复插入）: {skip_count} 个",
+                ]
+                QMessageBox.information(self, "完成", "\n".join(msg_lines))
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"生成失败: {str(e)}")
             finally:

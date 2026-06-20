@@ -11,7 +11,213 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_tables()
+        self._migrate_add_missing_columns()
+        self._migrate_deduplicate_schedules()
+        self._ensure_schedules_unique_index()
         self._init_default_data()
+
+    def _migrate_add_missing_columns(self):
+        """迁移：为旧版本数据库补齐缺失的列，避免后续报错"""
+        EXPECTED_COLUMNS = {
+            'chairs': ['id', 'name', 'description', 'is_active', 'created_at'],
+            'patients': ['id', 'name', 'phone', 'patient_type', 'stage', 'notes', 'created_at'],
+            'cycle_rules': ['id', 'name', 'chair_id', 'day_of_week', 'start_time', 'end_time',
+                            'interval_minutes', 'patient_type', 'is_active', 'created_at'],
+            'schedules': ['id', 'chair_id', 'patient_id', 'schedule_date', 'start_time',
+                          'end_time', 'status', 'patient_type', 'priority', 'cycle_rule_id',
+                          'notes', 'created_at'],
+            'queue': ['id', 'patient_id', 'schedule_id', 'queue_number', 'priority',
+                      'patient_type', 'status', 'chair_id', 'checkin_time', 'called_time',
+                      'completed_time'],
+            'priority_rules': ['id', 'name', 'patient_type', 'priority_level', 'can_jump',
+                               'description', 'created_at'],
+            'reminders': ['id', 'schedule_id', 'patient_id', 'reminder_time', 'status',
+                          'sent_time', 'message'],
+            'settings': ['key', 'value', 'description'],
+        }
+        COLUMN_DEFS = {
+            'is_active': 'INTEGER DEFAULT 1',
+            'created_at': 'TEXT',
+            'description': 'TEXT',
+            'name': 'TEXT NOT NULL DEFAULT \'\'',
+            'phone': 'TEXT',
+            'patient_type': 'TEXT DEFAULT \'normal\'',
+            'stage': 'TEXT',
+            'notes': 'TEXT',
+            'chair_id': 'INTEGER',
+            'day_of_week': 'INTEGER NOT NULL DEFAULT 0',
+            'start_time': 'TEXT NOT NULL DEFAULT \'00:00\'',
+            'end_time': 'TEXT NOT NULL DEFAULT \'00:00\'',
+            'interval_minutes': 'INTEGER DEFAULT 30',
+            'patient_id': 'INTEGER',
+            'schedule_date': 'TEXT NOT NULL DEFAULT \'\'',
+            'status': 'TEXT DEFAULT \'available\'',
+            'priority': 'INTEGER DEFAULT 0',
+            'cycle_rule_id': 'INTEGER',
+            'schedule_id': 'INTEGER',
+            'queue_number': 'INTEGER NOT NULL DEFAULT 0',
+            'priority_level': 'INTEGER DEFAULT 0',
+            'can_jump': 'INTEGER DEFAULT 0',
+            'reminder_time': 'TEXT NOT NULL DEFAULT \'\'',
+            'sent_time': 'TEXT',
+            'message': 'TEXT',
+            'value': 'TEXT',
+            'checkin_time': 'TEXT',
+            'called_time': 'TEXT',
+            'completed_time': 'TEXT',
+        }
+        try:
+            for table, expected_cols in EXPECTED_COLUMNS.items():
+                try:
+                    cursor = self.conn.execute(f"PRAGMA table_info({table})")
+                    existing = {row['name'] for row in cursor.fetchall()}
+                except Exception:
+                    continue
+                for col in expected_cols:
+                    if col not in existing and col in COLUMN_DEFS:
+                        try:
+                            self.conn.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {col} {COLUMN_DEFS[col]}"
+                            )
+                            print(f"[数据库迁移] 表 {table} 已新增列: {col}")
+                        except Exception as e:
+                            print(f"[数据库迁移] 表 {table} 新增列 {col} 失败: {e}")
+            self.conn.commit()
+        except Exception as e:
+            print(f"[数据库迁移] 补齐缺失列出错（已跳过）: {e}")
+            self.conn.rollback()
+
+    def _migrate_deduplicate_schedules(self):
+        """迁移：合并 schedules 表中的重复时段，保留患者预约信息"""
+        try:
+            # 检查是否有重复数据
+            cursor = self.conn.execute('''
+                SELECT chair_id, schedule_date, start_time, COUNT(*) as cnt
+                FROM schedules
+                GROUP BY chair_id, schedule_date, start_time
+                HAVING COUNT(*) > 1
+            ''')
+            duplicates = cursor.fetchall()
+            
+            if not duplicates:
+                return
+            
+            status_rank = {
+                'booked': 4,
+                'completed': 3,
+                'available': 2,
+                'cancelled': 1,
+            }
+            
+            total_merged = 0
+            
+            for dup in duplicates:
+                chair_id = dup['chair_id']
+                schedule_date = dup['schedule_date']
+                start_time = dup['start_time']
+                
+                # 取出该组所有重复记录
+                cursor = self.conn.execute('''
+                    SELECT * FROM schedules
+                    WHERE chair_id=? AND schedule_date=? AND start_time=?
+                    ORDER BY id
+                ''', (chair_id, schedule_date, start_time))
+                rows = cursor.fetchall()
+                
+                # 选一条要保留的：优先级最高的那条
+                def row_score(r):
+                    return (
+                        status_rank.get(r['status'], 0),
+                        1 if r['patient_id'] else 0,
+                        -r['id']  # 其他条件相同选 id 最大的
+                    )
+                
+                rows_sorted = sorted(rows, key=row_score, reverse=True)
+                keep_row = rows_sorted[0]
+                delete_rows = rows_sorted[1:]
+                
+                # 合并信息到 keep_row：patient_id, priority, patient_type, notes, cycle_rule_id
+                # 用 row.keys() 检查列是否存在，兼容旧版本数据库
+                keep_cols = keep_row.keys()
+                def safe_get(row, key, default=None):
+                    return row[key] if key in row.keys() else default
+                
+                keep_updates = {}
+                if not safe_get(keep_row, 'patient_id'):
+                    for r in delete_rows:
+                        if safe_get(r, 'patient_id'):
+                            keep_updates['patient_id'] = safe_get(r, 'patient_id')
+                            if safe_get(r, 'status') in ('booked', 'completed'):
+                                keep_updates['status'] = safe_get(r, 'status')
+                            pt = safe_get(r, 'patient_type')
+                            if pt and pt != 'normal':
+                                keep_updates['patient_type'] = pt
+                            pr = safe_get(r, 'priority')
+                            if pr and pr > 0:
+                                keep_updates['priority'] = pr
+                            break
+                if not safe_get(keep_row, 'cycle_rule_id') and 'cycle_rule_id' in keep_cols:
+                    for r in delete_rows:
+                        if safe_get(r, 'cycle_rule_id'):
+                            keep_updates['cycle_rule_id'] = safe_get(r, 'cycle_rule_id')
+                            break
+                if not safe_get(keep_row, 'notes') and 'notes' in keep_cols:
+                    for r in delete_rows:
+                        if safe_get(r, 'notes'):
+                            keep_updates['notes'] = safe_get(r, 'notes')
+                            break
+                
+                # 如果有需要合并的字段，更新保留行
+                if keep_updates:
+                    sets = ", ".join(f"{k}=?" for k in keep_updates.keys())
+                    params = list(keep_updates.values()) + [keep_row['id']]
+                    self.conn.execute(f"UPDATE schedules SET {sets} WHERE id=?", params)
+                
+                # 删除其他重复行
+                for r in delete_rows:
+                    # 如果被删行有关联的 reminders，转移到 keep_row
+                    self.conn.execute('''
+                        UPDATE reminders SET schedule_id=? WHERE schedule_id=?
+                    ''', (keep_row['id'], r['id']))
+                    # 如果被删行有关联的 queue，schedule_id 置空
+                    self.conn.execute('''
+                        UPDATE queue SET schedule_id=NULL WHERE schedule_id=?
+                    ''', (r['id'],))
+                    self.conn.execute("DELETE FROM schedules WHERE id=?", (r['id'],))
+                    total_merged += 1
+            
+            if total_merged > 0:
+                self.conn.commit()
+                print(f"[数据库迁移] 已合并 {total_merged} 条重复排期记录")
+        except Exception as e:
+            print(f"[数据库迁移] 合并重复排期出错（已跳过）: {e}")
+            self.conn.rollback()
+
+    def _ensure_schedules_unique_index(self):
+        """在去重完成后，安全地创建 schedules 唯一索引"""
+        try:
+            # 先确认没有重复
+            cursor = self.conn.execute('''
+                SELECT COUNT(*) as cnt FROM (
+                    SELECT chair_id, schedule_date, start_time
+                    FROM schedules
+                    GROUP BY chair_id, schedule_date, start_time
+                    HAVING COUNT(*) > 1
+                )
+            ''')
+            if cursor.fetchone()['cnt'] > 0:
+                print("[数据库] 警告：schedules 表仍存在重复数据，跳过创建唯一索引")
+                return
+
+            # 建唯一索引
+            self.conn.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_unique 
+                ON schedules(chair_id, schedule_date, start_time)
+            ''')
+            self.conn.commit()
+        except Exception as e:
+            print(f"[数据库] 创建 schedules 唯一索引出错（已跳过）: {e}")
+            self.conn.rollback()
 
     def _init_tables(self):
         cursor = self.conn.cursor()
@@ -64,12 +270,8 @@ class Database:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chair_id) REFERENCES chairs(id),
                 FOREIGN KEY (patient_id) REFERENCES patients(id),
-                FOREIGN KEY (cycle_rule_id) REFERENCES cycle_rules(id),
-                UNIQUE(chair_id, schedule_date, start_time)
+                FOREIGN KEY (cycle_rule_id) REFERENCES cycle_rules(id)
             );
-
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_unique 
-            ON schedules(chair_id, schedule_date, start_time);
 
             CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -509,10 +711,15 @@ class QueueManager:
         if is_jump and not can_jump:
             raise ValueError(f"患者类型 {patient_type} 不允许插队")
         
-        queue_number = self._get_next_queue_number()
+        next_num = self._get_next_queue_number()
         
         if is_jump and can_jump:
-            queue_number = self._get_jump_position(priority)
+            target_pos = self._get_jump_position(priority)
+            queue_number = target_pos
+            # 将目标位置及之后的等待患者号码整体后移
+            self._shift_queue_numbers(queue_number, +1)
+        else:
+            queue_number = next_num
         
         cursor = self.db.execute('''
             INSERT INTO queue 
@@ -541,6 +748,34 @@ class QueueManager:
         ''', (priority,))
         result = cursor.fetchone()
         return max(1, result['pos'] if result['pos'] else 1)
+
+    def _shift_queue_numbers(self, from_position: int, delta: int):
+        """将 waiting 状态中 queue_number >= from_position 的号码整体偏移 delta"""
+        if delta > 0:
+            # 从大到小更新，避免冲突
+            cursor = self.db.execute('''
+                SELECT id FROM queue
+                WHERE status='waiting' AND queue_number >= ?
+                ORDER BY queue_number DESC
+            ''', (from_position,))
+            rows = cursor.fetchall()
+            for row in rows:
+                self.db.execute(
+                    "UPDATE queue SET queue_number = queue_number + ? WHERE id = ?",
+                    (delta, row['id'])
+                )
+        elif delta < 0:
+            cursor = self.db.execute('''
+                SELECT id FROM queue
+                WHERE status='waiting' AND queue_number >= ?
+                ORDER BY queue_number ASC
+            ''', (from_position,))
+            rows = cursor.fetchall()
+            for row in rows:
+                self.db.execute(
+                    "UPDATE queue SET queue_number = queue_number + ? WHERE id = ?",
+                    (delta, row['id'])
+                )
 
     def _get_priority(self, patient_type: str) -> int:
         cursor = self.db.execute(
@@ -651,11 +886,41 @@ class QueueManager:
         if not self._can_jump(queue_item['patient_type']):
             raise ValueError("该患者类型不允许插队")
         
-        self.db.execute('''
-            UPDATE queue SET queue_number = ? WHERE id=?
-        ''', (target_position, queue_id))
-        self.db.commit()
-        return True
+        old_position = queue_item['queue_number']
+        
+        if old_position == target_position:
+            return True
+        
+        try:
+            # 先把该患者从原来的位置"挪开"，设一个临时大号码避免冲突
+            self.db.execute(
+                "UPDATE queue SET queue_number = 99999 WHERE id = ?",
+                (queue_id,)
+            )
+            
+            if target_position < old_position:
+                # 往前插队：目标位置到原位置-1 之间的号码都 +1
+                self.db.execute('''
+                    UPDATE queue SET queue_number = queue_number + 1
+                    WHERE status='waiting' AND queue_number >= ? AND queue_number < ?
+                ''', (target_position, old_position))
+            else:
+                # 往后挪：原位置+1 到目标位置之间的号码都 -1
+                self.db.execute('''
+                    UPDATE queue SET queue_number = queue_number - 1
+                    WHERE status='waiting' AND queue_number > ? AND queue_number <= ?
+                ''', (old_position, target_position))
+            
+            # 把该患者放到目标位置
+            self.db.execute(
+                "UPDATE queue SET queue_number = ? WHERE id = ?",
+                (target_position, queue_id)
+            )
+            self.db.commit()
+            return True
+        except Exception as e:
+            self.db.conn.rollback()
+            raise e
 
 
 class ReminderManager:
