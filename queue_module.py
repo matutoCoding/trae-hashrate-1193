@@ -150,23 +150,30 @@ class JumpQueueDialog(QDialog):
         self.queue_item = queue_item
         self.setWindowTitle("优先插队")
         self.setModal(True)
-        self.resize(400, 350)
+        self.resize(420, 300)
         
         layout = QFormLayout()
         
         self.patient_label = QLabel()
-        layout.addRow("当前患者:", self.patient_label)
+        self.patient_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1976D2;")
+        layout.addRow("患者:", self.patient_label)
         
-        self.current_position_label = QLabel()
-        layout.addRow("当前位置:", self.current_position_label)
+        self.current_number_label = QLabel()
+        layout.addRow("取号号码:", self.current_number_label)
         
-        self.target_position_spin = QSpinBox()
-        self.target_position_spin.setRange(1, 999)
-        layout.addRow("插队到位置:", self.target_position_spin)
+        self.patient_type_label = QLabel()
+        layout.addRow("患者类型:", self.patient_type_label)
         
-        self.jump_reason_edit = QLineEdit()
-        self.jump_reason_edit.setPlaceholderText("请输入插队原因（如：急诊、VIP等）")
-        layout.addRow("插队原因:", self.jump_reason_edit)
+        self.result_label = QLabel()
+        self.result_label.setStyleSheet("""
+            padding: 12px; 
+            background-color: #FFF3E0; 
+            border: 1px solid #FFB74D;
+            border-radius: 4px;
+            color: #E65100;
+            font-weight: bold;
+        """)
+        layout.addRow("插队效果:", self.result_label)
         
         self.priority_info = QLabel()
         self.priority_info.setWordWrap(True)
@@ -175,6 +182,8 @@ class JumpQueueDialog(QDialog):
         
         btn_layout = QHBoxLayout()
         self.ok_btn = QPushButton("确认插队")
+        self.ok_btn.setMinimumHeight(35)
+        self.ok_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
         self.cancel_btn = QPushButton("取消")
         btn_layout.addStretch()
         btn_layout.addWidget(self.ok_btn)
@@ -188,19 +197,22 @@ class JumpQueueDialog(QDialog):
         
         if queue_item:
             self.patient_label.setText(queue_item.get('patient_name', ''))
-            self.current_position_label.setText(str(queue_item.get('queue_number', 0)))
-            self.target_position_spin.setValue(max(1, queue_item.get('queue_number', 1) - 1))
+            self.current_number_label.setText(f"#{queue_item.get('queue_number', 0)}")
+            self.patient_type_label.setText(queue_item.get('patient_type', 'normal'))
             
             rule = priority_rule_manager.get_rule_by_type(queue_item.get('patient_type', 'normal'))
             if rule:
                 jump_text = "允许插队" if rule['can_jump'] else "不允许插队"
                 info = f"<b>{rule['name']}</b><br>优先级: {rule['priority_level']}<br>{jump_text}<br><i>{rule['description']}</i>"
                 self.priority_info.setText(info)
+                self.result_label.setText(
+                    "插队后将排到同类型等待患者的最前面\n"
+                    "（号码保持不变，按优先级排序自动靠前）"
+                )
     
     def get_data(self):
         return {
-            'target_position': self.target_position_spin.value(),
-            'reason': self.jump_reason_edit.text().strip()
+            'confirmed': True
         }
 
 
@@ -372,7 +384,10 @@ class QueueModule(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.create_queue_tab(), "排队叫号")
         self.tabs.addTab(self.create_jump_tab(), "优先插队")
+        self.tabs.addTab(self.create_overview_tab(), "队列总览")
         self.tabs.addTab(self.create_history_tab(), "今日记录")
+        
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         
         layout.addWidget(self.tabs)
         self.setLayout(layout)
@@ -593,6 +608,319 @@ class QueueModule(QWidget):
         self.refresh_jump_btn.clicked.connect(self.load_jump_data)
         
         return widget
+    
+    def create_overview_tab(self):
+        widget = QWidget()
+        main_layout = QVBoxLayout()
+        
+        summary_group = QGroupBox("今日总览")
+        summary_layout = QHBoxLayout()
+        
+        self.ov_waiting_card = self._create_stat_card("等待中", "0", "#f44336", "waiting")
+        self.ov_called_card = self._create_stat_card("已叫号", "0", "#2196F3", "called")
+        self.ov_completed_card = self._create_stat_card("已完成", "0", "#4CAF50", "completed")
+        self.ov_cancelled_card = self._create_stat_card("已取消", "0", "#9E9E9E", "cancelled")
+        self.ov_total_card = self._create_stat_card("总取号", "0", "#673AB7", "total")
+        
+        summary_layout.addWidget(self.ov_waiting_card)
+        summary_layout.addWidget(self.ov_called_card)
+        summary_layout.addWidget(self.ov_completed_card)
+        summary_layout.addWidget(self.ov_cancelled_card)
+        summary_layout.addWidget(self.ov_total_card)
+        
+        summary_group.setLayout(summary_layout)
+        main_layout.addWidget(summary_group)
+        
+        tables_layout = QHBoxLayout()
+        
+        chair_group = QGroupBox("按诊疗椅统计")
+        chair_layout = QVBoxLayout()
+        self.ov_chair_table = QTableWidget()
+        self.ov_chair_table.setColumnCount(5)
+        self.ov_chair_table.setHorizontalHeaderLabels(["诊疗椅", "等待", "已叫", "完成", "取消"])
+        self.ov_chair_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ov_chair_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ov_chair_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.ov_chair_table.cellClicked.connect(self.on_chair_stat_clicked)
+        chair_layout.addWidget(self.ov_chair_table)
+        chair_group.setLayout(chair_layout)
+        tables_layout.addWidget(chair_group)
+        
+        type_group = QGroupBox("按患者类型统计")
+        type_layout = QVBoxLayout()
+        self.ov_type_table = QTableWidget()
+        self.ov_type_table.setColumnCount(5)
+        self.ov_type_table.setHorizontalHeaderLabels(["患者类型", "等待", "已叫", "完成", "取消"])
+        self.ov_type_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ov_type_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ov_type_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.ov_type_table.cellClicked.connect(self.on_type_stat_clicked)
+        type_layout.addWidget(self.ov_type_table)
+        type_group.setLayout(type_layout)
+        tables_layout.addWidget(type_group)
+        
+        main_layout.addLayout(tables_layout)
+        
+        detail_group = QGroupBox("明细记录（点击上方统计数字查看对应记录）")
+        detail_layout = QVBoxLayout()
+        
+        self.ov_detail_filter_label = QLabel("当前筛选: 全部")
+        self.ov_detail_filter_label.setStyleSheet("color: #1976D2; font-weight: bold; padding: 4px;")
+        detail_layout.addWidget(self.ov_detail_filter_label)
+        
+        self.ov_detail_table = QTableWidget()
+        self.ov_detail_table.setColumnCount(7)
+        self.ov_detail_table.setHorizontalHeaderLabels(
+            ["号码", "患者", "类型", "诊疗椅", "状态", "取号时间", "备注"]
+        )
+        self.ov_detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ov_detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ov_detail_table.setSelectionBehavior(QTableWidget.SelectRows)
+        detail_layout.addWidget(self.ov_detail_table)
+        
+        btn_layout = QHBoxLayout()
+        self.ov_refresh_btn = QPushButton("刷新数据")
+        self.ov_clear_filter_btn = QPushButton("清除筛选")
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.ov_clear_filter_btn)
+        btn_layout.addWidget(self.ov_refresh_btn)
+        detail_layout.addLayout(btn_layout)
+        
+        detail_group.setLayout(detail_layout)
+        main_layout.addWidget(detail_group, 2)
+        
+        widget.setLayout(main_layout)
+        
+        self.ov_refresh_btn.clicked.connect(self.refresh_overview)
+        self.ov_clear_filter_btn.clicked.connect(self.clear_overview_filter)
+        
+        self._current_ov_chair = None
+        self._current_ov_type = None
+        self._current_ov_status = None
+        
+        return widget
+    
+    def _create_stat_card(self, title, value, color, status_key):
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setStyleSheet(f"""
+            QFrame {{
+                border: 2px solid {color};
+                border-radius: 8px;
+                background-color: white;
+                padding: 10px;
+            }}
+            QFrame:hover {{
+                background-color: #f5f5f5;
+            }}
+        """)
+        card.setProperty("status_key", status_key)
+        card.setCursor(Qt.PointingHandCursor)
+        
+        layout = QVBoxLayout()
+        layout.setSpacing(5)
+        
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
+        layout.addWidget(title_label)
+        
+        value_label = QLabel(value)
+        value_label.setAlignment(Qt.AlignCenter)
+        value_label.setStyleSheet(f"color: {color}; font-size: 28px; font-weight: bold;")
+        value_label.setProperty("card_value", True)
+        layout.addWidget(value_label)
+        
+        card.setLayout(layout)
+        card.mousePressEvent = lambda e: self.on_stat_card_clicked(status_key)
+        
+        return card
+    
+    def on_tab_changed(self, index):
+        tab_name = self.tabs.tabText(index)
+        if tab_name == "队列总览":
+            self.refresh_overview()
+        elif tab_name == "今日记录":
+            self.load_history()
+    
+    def on_stat_card_clicked(self, status_key):
+        if status_key == 'total':
+            self._current_ov_status = None
+        else:
+            self._current_ov_status = status_key
+        self.refresh_overview_details()
+    
+    def on_chair_stat_clicked(self, row, col):
+        if col == 0:
+            return
+        chair_item = self.ov_chair_table.item(row, 0)
+        if chair_item:
+            chair_id = chair_item.data(Qt.UserRole)
+            self._current_ov_chair = chair_id
+            status_map = {1: 'waiting', 2: 'called', 3: 'completed', 4: 'cancelled'}
+            if col in status_map:
+                self._current_ov_status = status_map[col]
+            else:
+                self._current_ov_status = None
+            self.refresh_overview_details()
+    
+    def on_type_stat_clicked(self, row, col):
+        if col == 0:
+            return
+        type_item = self.ov_type_table.item(row, 0)
+        if type_item:
+            patient_type = type_item.data(Qt.UserRole)
+            self._current_ov_type = patient_type
+            status_map = {1: 'waiting', 2: 'called', 3: 'completed', 4: 'cancelled'}
+            if col in status_map:
+                self._current_ov_status = status_map[col]
+            else:
+                self._current_ov_status = None
+            self.refresh_overview_details()
+    
+    def clear_overview_filter(self):
+        self._current_ov_chair = None
+        self._current_ov_type = None
+        self._current_ov_status = None
+        self.refresh_overview()
+    
+    def refresh_overview(self):
+        try:
+            self._refresh_overview_summary()
+            self._refresh_overview_chair()
+            self._refresh_overview_type()
+            self.refresh_overview_details()
+        except Exception as e:
+            print(f"刷新队列总览出错: {e}")
+    
+    def _refresh_overview_summary(self):
+        stats = queue_manager.get_queue_stats()
+        status_labels = {
+            'waiting': ('等待中', self.ov_waiting_card),
+            'called': ('已叫号', self.ov_called_card),
+            'completed': ('已完成', self.ov_completed_card),
+            'cancelled': ('已取消', self.ov_cancelled_card),
+            'total': ('总取号', self.ov_total_card),
+        }
+        for key, (_, card) in status_labels.items():
+            value = stats.get(key, 0)
+            value_label = card.findChild(QLabel, "", Qt.FindDirectChildrenOnly)
+            if value_label:
+                value_label.setText(str(value))
+    
+    def _refresh_overview_chair(self):
+        chairs = chair_manager.get_all_chairs()
+        self.ov_chair_table.setRowCount(0)
+        
+        for chair in chairs:
+            stats = queue_manager.get_queue_stats(chair_id=chair['id'])
+            row = self.ov_chair_table.rowCount()
+            self.ov_chair_table.insertRow(row)
+            
+            chair_item = QTableWidgetItem(chair['name'])
+            chair_item.setData(Qt.UserRole, chair['id'])
+            self.ov_chair_table.setItem(row, 0, chair_item)
+            
+            self.ov_chair_table.setItem(row, 1, QTableWidgetItem(str(stats['waiting'])))
+            self.ov_chair_table.setItem(row, 2, QTableWidgetItem(str(stats['called'])))
+            self.ov_chair_table.setItem(row, 3, QTableWidgetItem(str(stats['completed'])))
+            self.ov_chair_table.setItem(row, 4, QTableWidgetItem(str(stats['cancelled'])))
+            
+            for col in range(1, 5):
+                item = self.ov_chair_table.item(row, col)
+                item.setTextAlignment(Qt.AlignCenter)
+    
+    def _refresh_overview_type(self):
+        rules = priority_rule_manager.get_all_rules()
+        self.ov_type_table.setRowCount(0)
+        
+        for rule in rules:
+            stats = queue_manager.get_queue_stats(patient_type=rule['patient_type'])
+            row = self.ov_type_table.rowCount()
+            self.ov_type_table.insertRow(row)
+            
+            type_item = QTableWidgetItem(rule['name'])
+            type_item.setData(Qt.UserRole, rule['patient_type'])
+            self.ov_type_table.setItem(row, 0, type_item)
+            
+            self.ov_type_table.setItem(row, 1, QTableWidgetItem(str(stats['waiting'])))
+            self.ov_type_table.setItem(row, 2, QTableWidgetItem(str(stats['called'])))
+            self.ov_type_table.setItem(row, 3, QTableWidgetItem(str(stats['completed'])))
+            self.ov_type_table.setItem(row, 4, QTableWidgetItem(str(stats['cancelled'])))
+            
+            for col in range(1, 5):
+                item = self.ov_type_table.item(row, col)
+                item.setTextAlignment(Qt.AlignCenter)
+    
+    def refresh_overview_details(self):
+        try:
+            filter_parts = []
+            if self._current_ov_chair:
+                chair = chair_manager.get_chair(self._current_ov_chair)
+                if chair:
+                    filter_parts.append(f"诊疗椅: {chair['name']}")
+            if self._current_ov_type:
+                rule = priority_rule_manager.get_rule_by_type(self._current_ov_type)
+                if rule:
+                    filter_parts.append(f"类型: {rule['name']}")
+            if self._current_ov_status:
+                status_names = {'waiting': '等待中', 'called': '已叫号', 'completed': '已完成', 'cancelled': '已取消'}
+                filter_parts.append(f"状态: {status_names.get(self._current_ov_status, self._current_ov_status)}")
+            
+            filter_text = "当前筛选: " + (" | ".join(filter_parts) if filter_parts else "全部")
+            self.ov_detail_filter_label.setText(filter_text)
+            
+            if self._current_ov_status:
+                items = queue_manager.get_queue_by_status(
+                    self._current_ov_status,
+                    chair_id=self._current_ov_chair,
+                    patient_type=self._current_ov_type
+                )
+            else:
+                items = []
+                if self._current_ov_chair or self._current_ov_type:
+                    for status in ['waiting', 'called', 'completed', 'cancelled']:
+                        items.extend(queue_manager.get_queue_by_status(
+                            status,
+                            chair_id=self._current_ov_chair,
+                            patient_type=self._current_ov_type
+                        ))
+                else:
+                    items = queue_manager.get_today_queue()
+            
+            self._fill_detail_table(items)
+        except Exception as e:
+            print(f"刷新明细出错: {e}")
+    
+    def _fill_detail_table(self, items):
+        self.ov_detail_table.setRowCount(0)
+        status_names = {'waiting': '等待中', 'called': '已叫号', 'completed': '已完成', 'cancelled': '已取消'}
+        
+        for item in items:
+            row = self.ov_detail_table.rowCount()
+            self.ov_detail_table.insertRow(row)
+            
+            num_item = QTableWidgetItem(f"#{item['queue_number']}")
+            num_item.setTextAlignment(Qt.AlignCenter)
+            self.ov_detail_table.setItem(row, 0, num_item)
+            
+            self.ov_detail_table.setItem(row, 1, QTableWidgetItem(item.get('patient_name', '')))
+            self.ov_detail_table.setItem(row, 2, QTableWidgetItem(item.get('patient_type', '')))
+            self.ov_detail_table.setItem(row, 3, QTableWidgetItem(item.get('chair_name', '不限')))
+            
+            status_text = status_names.get(item.get('status', ''), item.get('status', ''))
+            self.ov_detail_table.setItem(row, 4, QTableWidgetItem(status_text))
+            self.ov_detail_table.setItem(row, 5, QTableWidgetItem(item.get('checkin_time', '')[:19] if item.get('checkin_time') else ''))
+            
+            note_text = ""
+            if item.get('is_jumped'):
+                note_text = "已插队"
+            self.ov_detail_table.setItem(row, 6, QTableWidgetItem(note_text))
+            
+            for col in range(self.ov_detail_table.columnCount()):
+                cell_item = self.ov_detail_table.item(row, col)
+                if cell_item:
+                    cell_item.setTextAlignment(Qt.AlignCenter)
     
     def create_history_tab(self):
         widget = QWidget()
@@ -981,16 +1309,15 @@ class QueueModule(QWidget):
         
         dialog = JumpQueueDialog(self, queue_item)
         if dialog.exec() == QDialog.Accepted:
-            data = dialog.get_data()
-            
             try:
-                success = queue_manager.jump_queue(queue_item['id'], data['target_position'])
+                success = queue_manager.jump_queue(queue_item['id'])
                 if success:
                     QMessageBox.information(self, "成功", 
-                        f"患者已插队到第 {data['target_position']} 位")
+                        f"患者 {queue_item['patient_name']}（号#{queue_item['queue_number']}）已插队到同类型最前面")
                     self.load_queue()
                     self.load_jump_data()
                     self.load_history()
+                    self.refresh_overview()
                 else:
                     QMessageBox.warning(self, "失败", "插队失败")
             except ValueError as e:

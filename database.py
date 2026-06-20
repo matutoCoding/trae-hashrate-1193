@@ -28,12 +28,15 @@ class Database:
                           'notes', 'created_at'],
             'queue': ['id', 'patient_id', 'schedule_id', 'queue_number', 'priority',
                       'patient_type', 'status', 'chair_id', 'checkin_time', 'called_time',
-                      'completed_time'],
+                      'completed_time', 'is_jumped'],
             'priority_rules': ['id', 'name', 'patient_type', 'priority_level', 'can_jump',
                                'description', 'created_at'],
             'reminders': ['id', 'schedule_id', 'patient_id', 'reminder_time', 'status',
                           'sent_time', 'message'],
             'settings': ['key', 'value', 'description'],
+            'schedule_dedup_log': ['id', 'merge_time', 'chair_id', 'schedule_date', 
+                                   'start_time', 'kept_schedule_id', 'merged_count', 
+                                   'kept_patient_id', 'kept_status', 'detail'],
         }
         COLUMN_DEFS = {
             'is_active': 'INTEGER DEFAULT 1',
@@ -65,6 +68,13 @@ class Database:
             'checkin_time': 'TEXT',
             'called_time': 'TEXT',
             'completed_time': 'TEXT',
+            'is_jumped': 'INTEGER DEFAULT 0',
+            'merge_time': 'TEXT',
+            'kept_schedule_id': 'INTEGER',
+            'merged_count': 'INTEGER DEFAULT 0',
+            'kept_patient_id': 'INTEGER',
+            'kept_status': 'TEXT',
+            'detail': 'TEXT',
         }
         try:
             for table, expected_cols in EXPECTED_COLUMNS.items():
@@ -174,6 +184,7 @@ class Database:
                     self.conn.execute(f"UPDATE schedules SET {sets} WHERE id=?", params)
                 
                 # 删除其他重复行
+                detail_parts = []
                 for r in delete_rows:
                     # 如果被删行有关联的 reminders，转移到 keep_row
                     self.conn.execute('''
@@ -183,15 +194,39 @@ class Database:
                     self.conn.execute('''
                         UPDATE queue SET schedule_id=NULL WHERE schedule_id=?
                     ''', (r['id'],))
+                    # 记录详情
+                    r_patient = safe_get(r, 'patient_id')
+                    r_status = safe_get(r, 'status')
+                    detail_parts.append(f"删除id={r['id']}(患者={r_patient},状态={r_status})")
                     self.conn.execute("DELETE FROM schedules WHERE id=?", (r['id'],))
                     total_merged += 1
+                
+                # 记录合并日志
+                self.conn.execute('''
+                    INSERT INTO schedule_dedup_log 
+                    (chair_id, schedule_date, start_time, kept_schedule_id, merged_count,
+                     kept_patient_id, kept_status, detail)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    safe_get(keep_row, 'chair_id'),
+                    safe_get(keep_row, 'schedule_date'),
+                    safe_get(keep_row, 'start_time'),
+                    keep_row['id'],
+                    len(delete_rows),
+                    safe_get(keep_row, 'patient_id'),
+                    safe_get(keep_row, 'status'),
+                    "; ".join(detail_parts)
+                ))
             
             if total_merged > 0:
                 self.conn.commit()
                 print(f"[数据库迁移] 已合并 {total_merged} 条重复排期记录")
         except Exception as e:
             print(f"[数据库迁移] 合并重复排期出错（已跳过）: {e}")
-            self.conn.rollback()
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def _ensure_schedules_unique_index(self):
         """在去重完成后，安全地创建 schedules 唯一索引"""
@@ -316,6 +351,19 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 description TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS schedule_dedup_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merge_time TEXT DEFAULT CURRENT_TIMESTAMP,
+                chair_id INTEGER,
+                schedule_date TEXT,
+                start_time TEXT,
+                kept_schedule_id INTEGER,
+                merged_count INTEGER DEFAULT 0,
+                kept_patient_id INTEGER,
+                kept_status TEXT,
+                detail TEXT
             );
         ''')
         
@@ -697,6 +745,45 @@ class ScheduleManager:
         ''', (today.isoformat(), end_date.isoformat()))
         return [dict(row) for row in cursor.fetchall()]
 
+    def get_dedup_logs(self, days: int = 30, chair_id: Optional[int] = None) -> List[Dict]:
+        """获取去重合并日志记录"""
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days)
+        
+        sql = '''
+            SELECT l.*, c.name as chair_name, p.name as patient_name
+            FROM schedule_dedup_log l
+            LEFT JOIN chairs c ON l.chair_id = c.id
+            LEFT JOIN patients p ON l.kept_patient_id = p.id
+            WHERE l.merge_time >= ?
+        '''
+        params = [start_date.isoformat()]
+        
+        if chair_id:
+            sql += " AND l.chair_id = ?"
+            params.append(chair_id)
+        
+        sql += " ORDER BY l.merge_time DESC, l.id DESC"
+        cursor = self.db.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_dedup_summary(self, days: int = 30) -> Dict:
+        """获取去重合并统计摘要"""
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days)
+        
+        cursor = self.db.execute('''
+            SELECT 
+                COUNT(*) as merge_count,
+                COALESCE(SUM(merged_count), 0) as total_merged,
+                COALESCE(SUM(CASE WHEN kept_patient_id IS NOT NULL THEN 1 ELSE 0 END), 0) as kept_patient_count
+            FROM schedule_dedup_log
+            WHERE merge_time >= ?
+        ''', (start_date.isoformat(),))
+        result = dict(cursor.fetchone())
+        result['days'] = days
+        return result
+
 
 class QueueManager:
     def __init__(self, db: Database):
@@ -711,22 +798,16 @@ class QueueManager:
         if is_jump and not can_jump:
             raise ValueError(f"患者类型 {patient_type} 不允许插队")
         
-        next_num = self._get_next_queue_number()
-        
-        if is_jump and can_jump:
-            target_pos = self._get_jump_position(priority)
-            queue_number = target_pos
-            # 将目标位置及之后的等待患者号码整体后移
-            self._shift_queue_numbers(queue_number, +1)
-        else:
-            queue_number = next_num
+        queue_number = self._get_next_queue_number()
+        is_jumped = 1 if is_jump else 0
         
         cursor = self.db.execute('''
             INSERT INTO queue 
             (patient_id, schedule_id, queue_number, priority, patient_type, 
-             status, chair_id)
-            VALUES (?, ?, ?, ?, ?, 'waiting', ?)
-        ''', (patient_id, schedule_id, queue_number, priority, patient_type, chair_id))
+             status, chair_id, is_jumped)
+            VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?)
+        ''', (patient_id, schedule_id, queue_number, priority, 
+              patient_type, chair_id, is_jumped))
         self.db.commit()
         
         return self.get_queue_item(cursor.lastrowid)
@@ -739,43 +820,6 @@ class QueueManager:
             WHERE DATE(checkin_time) = ?
         ''', (today,))
         return cursor.fetchone()['next_num']
-
-    def _get_jump_position(self, priority: int) -> int:
-        cursor = self.db.execute('''
-            SELECT COALESCE(MIN(queue_number), 1) as pos
-            FROM queue
-            WHERE status='waiting' AND priority < ?
-        ''', (priority,))
-        result = cursor.fetchone()
-        return max(1, result['pos'] if result['pos'] else 1)
-
-    def _shift_queue_numbers(self, from_position: int, delta: int):
-        """将 waiting 状态中 queue_number >= from_position 的号码整体偏移 delta"""
-        if delta > 0:
-            # 从大到小更新，避免冲突
-            cursor = self.db.execute('''
-                SELECT id FROM queue
-                WHERE status='waiting' AND queue_number >= ?
-                ORDER BY queue_number DESC
-            ''', (from_position,))
-            rows = cursor.fetchall()
-            for row in rows:
-                self.db.execute(
-                    "UPDATE queue SET queue_number = queue_number + ? WHERE id = ?",
-                    (delta, row['id'])
-                )
-        elif delta < 0:
-            cursor = self.db.execute('''
-                SELECT id FROM queue
-                WHERE status='waiting' AND queue_number >= ?
-                ORDER BY queue_number ASC
-            ''', (from_position,))
-            rows = cursor.fetchall()
-            for row in rows:
-                self.db.execute(
-                    "UPDATE queue SET queue_number = queue_number + ? WHERE id = ?",
-                    (delta, row['id'])
-                )
 
     def _get_priority(self, patient_type: str) -> int:
         cursor = self.db.execute(
@@ -806,7 +850,7 @@ class QueueManager:
             sql += " AND (q.chair_id=? OR q.chair_id IS NULL)"
             params.append(chair_id)
         
-        sql += " ORDER BY q.priority DESC, q.queue_number ASC LIMIT 1"
+        sql += " ORDER BY q.priority DESC, q.is_jumped DESC, q.queue_number ASC LIMIT 1"
         
         cursor = self.db.execute(sql, params)
         row = cursor.fetchone()
@@ -849,7 +893,7 @@ class QueueManager:
             sql += " AND (q.chair_id=? OR q.chair_id IS NULL)"
             params.append(chair_id)
         
-        sql += " ORDER BY q.priority DESC, q.queue_number ASC"
+        sql += " ORDER BY q.priority DESC, q.is_jumped DESC, q.queue_number ASC"
         cursor = self.db.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
 
@@ -874,11 +918,11 @@ class QueueManager:
             LEFT JOIN patients p ON q.patient_id = p.id
             LEFT JOIN chairs c ON q.chair_id = c.id
             WHERE DATE(q.checkin_time) = ?
-            ORDER BY q.priority DESC, q.queue_number ASC
+            ORDER BY q.priority DESC, q.is_jumped DESC, q.queue_number ASC
         ''', (today,))
         return [dict(row) for row in cursor.fetchall()]
 
-    def jump_queue(self, queue_id: int, target_position: int) -> bool:
+    def jump_queue(self, queue_id: int) -> bool:
         queue_item = self.get_queue_item(queue_id)
         if not queue_item:
             return False
@@ -886,41 +930,62 @@ class QueueManager:
         if not self._can_jump(queue_item['patient_type']):
             raise ValueError("该患者类型不允许插队")
         
-        old_position = queue_item['queue_number']
+        if queue_item['status'] != 'waiting':
+            raise ValueError("只有等待中的患者才能插队")
         
-        if old_position == target_position:
-            return True
+        # 号码保持不变，设置 is_jumped=1 使其在同优先级中排最前
+        self.db.execute(
+            "UPDATE queue SET is_jumped = 1 WHERE id = ?",
+            (queue_id,)
+        )
+        self.db.commit()
+        return True
+
+    def get_queue_stats(self, chair_id: Optional[int] = None, 
+                        patient_type: Optional[str] = None) -> Dict[str, int]:
+        """获取队列统计：等待、已叫、完成、取消数量"""
+        sql = "SELECT status, COUNT(*) as cnt FROM queue WHERE DATE(checkin_time) = DATE('now')"
+        params = []
         
-        try:
-            # 先把该患者从原来的位置"挪开"，设一个临时大号码避免冲突
-            self.db.execute(
-                "UPDATE queue SET queue_number = 99999 WHERE id = ?",
-                (queue_id,)
-            )
-            
-            if target_position < old_position:
-                # 往前插队：目标位置到原位置-1 之间的号码都 +1
-                self.db.execute('''
-                    UPDATE queue SET queue_number = queue_number + 1
-                    WHERE status='waiting' AND queue_number >= ? AND queue_number < ?
-                ''', (target_position, old_position))
-            else:
-                # 往后挪：原位置+1 到目标位置之间的号码都 -1
-                self.db.execute('''
-                    UPDATE queue SET queue_number = queue_number - 1
-                    WHERE status='waiting' AND queue_number > ? AND queue_number <= ?
-                ''', (old_position, target_position))
-            
-            # 把该患者放到目标位置
-            self.db.execute(
-                "UPDATE queue SET queue_number = ? WHERE id = ?",
-                (target_position, queue_id)
-            )
-            self.db.commit()
-            return True
-        except Exception as e:
-            self.db.conn.rollback()
-            raise e
+        if chair_id:
+            sql += " AND chair_id = ?"
+            params.append(chair_id)
+        if patient_type:
+            sql += " AND patient_type = ?"
+            params.append(patient_type)
+        
+        sql += " GROUP BY status"
+        cursor = self.db.execute(sql, params)
+        
+        stats = {'waiting': 0, 'called': 0, 'completed': 0, 'cancelled': 0, 'total': 0}
+        for row in cursor.fetchall():
+            stats[row['status']] = row['cnt']
+            stats['total'] += row['cnt']
+        return stats
+
+    def get_queue_by_status(self, status: str, chair_id: Optional[int] = None,
+                            patient_type: Optional[str] = None) -> List[Dict]:
+        """按状态+椅+类型筛选队列记录"""
+        sql = '''
+            SELECT q.*, p.name as patient_name, p.phone as patient_phone,
+                   c.name as chair_name
+            FROM queue q
+            LEFT JOIN patients p ON q.patient_id = p.id
+            LEFT JOIN chairs c ON q.chair_id = c.id
+            WHERE DATE(q.checkin_time) = DATE('now') AND q.status = ?
+        '''
+        params = [status]
+        
+        if chair_id:
+            sql += " AND q.chair_id = ?"
+            params.append(chair_id)
+        if patient_type:
+            sql += " AND q.patient_type = ?"
+            params.append(patient_type)
+        
+        sql += " ORDER BY q.priority DESC, q.is_jumped DESC, q.queue_number ASC"
+        cursor = self.db.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
 
 
 class ReminderManager:

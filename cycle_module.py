@@ -408,6 +408,9 @@ class CycleModule(QWidget):
         self.tabs.addTab(self.create_batch_tab(), "批量生成空时段")
         self.tabs.addTab(self.create_patient_cycle_tab(), "患者周期排期")
         self.tabs.addTab(self.create_schedule_list_tab(), "排期列表")
+        self.tabs.addTab(self.create_dedup_tab(), "重复清理明细")
+        
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         
         layout.addWidget(self.tabs)
         self.setLayout(layout)
@@ -1177,3 +1180,162 @@ class CycleModule(QWidget):
             schedule_manager.delete_schedule(schedule_id)
             self.load_schedule_list()
             self.load_calendar()
+    
+    def on_tab_changed(self, index):
+        tab_name = self.tabs.tabText(index)
+        if tab_name == "重复清理明细":
+            self.load_dedup_logs()
+    
+    def create_dedup_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        summary_group = QGroupBox("合并统计")
+        summary_layout = QHBoxLayout()
+        
+        self.dedup_summary_label = QLabel("暂无合并记录")
+        self.dedup_summary_label.setStyleSheet("font-size: 14px; padding: 8px;")
+        summary_layout.addWidget(self.dedup_summary_label)
+        summary_layout.addStretch()
+        
+        self.dedup_days_spin = QSpinBox()
+        self.dedup_days_spin.setRange(1, 365)
+        self.dedup_days_spin.setValue(30)
+        self.dedup_days_spin.setSuffix(" 天")
+        summary_layout.addWidget(QLabel("统计范围:"))
+        summary_layout.addWidget(self.dedup_days_spin)
+        
+        self.refresh_dedup_btn = QPushButton("刷新")
+        self.refresh_dedup_btn.clicked.connect(self.load_dedup_logs)
+        summary_layout.addWidget(self.refresh_dedup_btn)
+        
+        summary_group.setLayout(summary_layout)
+        layout.addWidget(summary_group)
+        
+        filter_group = QGroupBox("筛选")
+        filter_layout = QHBoxLayout()
+        
+        filter_layout.addWidget(QLabel("诊疗椅:"))
+        self.dedup_chair_filter = QComboBox()
+        self.dedup_chair_filter.addItem("全部", None)
+        chairs = chair_manager.get_all_chairs()
+        for chair in chairs:
+            self.dedup_chair_filter.addItem(chair['name'], chair['id'])
+        filter_layout.addWidget(self.dedup_chair_filter)
+        
+        self.apply_dedup_filter_btn = QPushButton("应用筛选")
+        self.apply_dedup_filter_btn.clicked.connect(self.load_dedup_logs)
+        filter_layout.addWidget(self.apply_dedup_filter_btn)
+        filter_layout.addStretch()
+        
+        filter_group.setLayout(filter_layout)
+        layout.addWidget(filter_group)
+        
+        detail_group = QGroupBox("合并明细")
+        detail_layout = QVBoxLayout()
+        
+        self.dedup_table = QTableWidget()
+        self.dedup_table.setColumnCount(7)
+        self.dedup_table.setHorizontalHeaderLabels([
+            "合并时间", "诊疗椅", "排期日期", "开始时间", 
+            "合并数", "保留患者", "保留状态"
+        ])
+        self.dedup_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.dedup_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.dedup_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.dedup_table.setAlternatingRowColors(True)
+        self.dedup_table.doubleClicked.connect(self.show_dedup_detail)
+        detail_layout.addWidget(self.dedup_table)
+        
+        tip_label = QLabel("提示：双击记录可查看详细合并信息")
+        tip_label.setStyleSheet("color: #888; padding: 4px;")
+        detail_layout.addWidget(tip_label)
+        
+        detail_group.setLayout(detail_layout)
+        layout.addWidget(detail_group, 1)
+        
+        widget.setLayout(layout)
+        return widget
+    
+    def load_dedup_logs(self):
+        try:
+            days = self.dedup_days_spin.value()
+            chair_id = self.dedup_chair_filter.currentData()
+            
+            logs = schedule_manager.get_dedup_logs(days, chair_id)
+            summary = schedule_manager.get_dedup_summary(days)
+            
+            self.dedup_summary_label.setText(
+                f"近{days}天共合并 {summary['merge_count']} 组重复时段，"
+                f"清理了 {summary['total_merged']} 条重复记录，"
+                f"保留了 {summary['kept_patient_count']} 位患者的预约信息"
+            )
+            
+            self.dedup_table.setRowCount(0)
+            
+            status_names = {
+                'available': '可用',
+                'booked': '已预约',
+                'completed': '已完成',
+                'cancelled': '已取消',
+            }
+            
+            for log in logs:
+                row = self.dedup_table.rowCount()
+                self.dedup_table.insertRow(row)
+                
+                merge_time = log.get('merge_time', '')[:19] if log.get('merge_time') else ''
+                self.dedup_table.setItem(row, 0, QTableWidgetItem(merge_time))
+                self.dedup_table.setItem(row, 1, QTableWidgetItem(log.get('chair_name', '')))
+                self.dedup_table.setItem(row, 2, QTableWidgetItem(log.get('schedule_date', '')))
+                self.dedup_table.setItem(row, 3, QTableWidgetItem(log.get('start_time', '')))
+                self.dedup_table.setItem(row, 4, QTableWidgetItem(str(log.get('merged_count', 0))))
+                self.dedup_table.setItem(row, 5, QTableWidgetItem(log.get('patient_name') or '无患者'))
+                
+                kept_status = log.get('kept_status', '')
+                status_text = status_names.get(kept_status, kept_status)
+                self.dedup_table.setItem(row, 6, QTableWidgetItem(status_text))
+                
+                for col in range(self.dedup_table.columnCount()):
+                    item = self.dedup_table.item(row, col)
+                    if item:
+                        item.setTextAlignment(Qt.AlignCenter)
+                
+                self.dedup_table.item(row, 0).setData(Qt.UserRole, log)
+        except Exception as e:
+            print(f"加载去重日志出错: {e}")
+    
+    def show_dedup_detail(self):
+        current_row = self.dedup_table.currentRow()
+        if current_row < 0:
+            return
+        
+        log = self.dedup_table.item(current_row, 0).data(Qt.UserRole)
+        if not log:
+            return
+        
+        detail = log.get('detail', '')
+        status_names = {
+            'available': '可用',
+            'booked': '已预约',
+            'completed': '已完成',
+            'cancelled': '已取消',
+        }
+        kept_status = status_names.get(log.get('kept_status', ''), log.get('kept_status', ''))
+        
+        msg = (
+            f"合并详情\n\n"
+            f"合并时间: {log.get('merge_time', '')[:19]}\n"
+            f"诊疗椅: {log.get('chair_name', '')}\n"
+            f"排期日期: {log.get('schedule_date', '')}\n"
+            f"开始时间: {log.get('start_time', '')}\n"
+            f"合并数: {log.get('merged_count', 0)} 条\n"
+            f"保留排期ID: {log.get('kept_schedule_id', '')}\n"
+            f"保留患者: {log.get('patient_name') or '无患者'}\n"
+            f"保留状态: {kept_status}\n"
+        )
+        
+        if detail:
+            msg += f"\n详细记录:\n{detail}"
+        
+        QMessageBox.information(self, "合并详情", msg)
