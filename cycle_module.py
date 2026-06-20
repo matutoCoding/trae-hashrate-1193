@@ -755,7 +755,7 @@ class CycleModule(QWidget):
             progress.show()
             
             try:
-                count = schedule_manager.generate_cycle_schedules(
+                added_count, total_count = schedule_manager.generate_cycle_schedules(
                     data['rule_id'], data['start_date'], data['end_date'],
                     data['patient_id']
                 )
@@ -770,7 +770,12 @@ class CycleModule(QWidget):
                 
                 progress.setValue(100)
                 
-                QMessageBox.information(self, "成功", f"成功生成 {count} 个时段的排期")
+                skip_count = total_count - added_count
+                if skip_count > 0:
+                    msg = f"排期生成完成！\n\n新增排期: {added_count} 个\n已存在跳过: {skip_count} 个\n总时段数: {total_count} 个"
+                else:
+                    msg = f"成功生成 {added_count} 个时段的排期"
+                QMessageBox.information(self, "完成", msg)
                 self.load_calendar()
                 self.load_schedule_list()
             except Exception as e:
@@ -796,7 +801,7 @@ class CycleModule(QWidget):
             progress.show()
             
             try:
-                count = schedule_manager.generate_batch_schedules(
+                added_count, total_count = schedule_manager.generate_batch_schedules(
                     data['chair_id'], data['start_date'], data['end_date'],
                     data['day_of_week'], data['start_time'], data['end_time'],
                     data['interval_minutes']
@@ -804,7 +809,12 @@ class CycleModule(QWidget):
                 
                 progress.setValue(100)
                 
-                QMessageBox.information(self, "成功", f"成功生成 {count} 天空时段")
+                skip_count = total_count - added_count
+                if skip_count > 0:
+                    msg = f"空时段生成完成！\n\n新增空时段: {added_count} 个\n已存在跳过: {skip_count} 个\n总时段数: {total_count} 个"
+                else:
+                    msg = f"成功生成 {added_count} 个空时段"
+                QMessageBox.information(self, "完成", msg)
                 self.load_batch_results()
                 self.load_calendar()
             except Exception as e:
@@ -872,13 +882,25 @@ class CycleModule(QWidget):
             
             try:
                 cycle_days = data['cycle_weeks'] * 7
-                count = 0
+                
+                # 找到第一个匹配规则星期的日期
                 current_date = data['start_date']
+                days_diff = (rule['day_of_week'] - current_date.weekday() + 7) % 7
+                current_date += timedelta(days=days_diff)
+                
+                count = 0
+                skip_count = 0
+                full_dates = []
                 
                 while current_date <= data['end_date']:
-                    if current_date.weekday() == rule['day_of_week']:
-                        self._generate_patient_schedule(rule, current_date, data['patient_id'], patient['patient_type'])
+                    result = self._generate_patient_schedule(
+                        rule, current_date, data['patient_id'], patient['patient_type']
+                    )
+                    if result == 'booked':
                         count += 1
+                    elif result == 'full':
+                        skip_count += 1
+                        full_dates.append(current_date.strftime("%Y-%m-%d"))
                     current_date += timedelta(days=cycle_days)
                 
                 chair_manager.db.commit()
@@ -896,7 +918,14 @@ class CycleModule(QWidget):
                 
                 progress.setValue(100)
                 
-                QMessageBox.information(self, "成功", f"成功为患者生成 {count} 次复诊排期")
+                msg = f"患者周期排期完成！\n\n成功排期: {count} 次"
+                if skip_count > 0:
+                    msg += f"\n时段已满跳过: {skip_count} 次"
+                    if len(full_dates) <= 5:
+                        msg += f"\n跳过日期: {', '.join(full_dates)}"
+                    else:
+                        msg += f"\n跳过日期: {', '.join(full_dates[:5])} 等"
+                QMessageBox.information(self, "完成", msg)
                 self.load_patient_schedules()
                 self.load_calendar()
             except Exception as e:
@@ -904,43 +933,69 @@ class CycleModule(QWidget):
             finally:
                 progress.close()
     
-    def _generate_patient_schedule(self, rule, schedule_date, patient_id, patient_type):
+    def _generate_patient_schedule(self, rule, schedule_date, patient_id, patient_type) -> str:
+        """为患者在指定日期分配一个可用时段（每周期只占一个）
+        返回: 'booked'=成功占用, 'full'=目标时段已满, 'exists'=已占用
+        """
         start = datetime.strptime(rule['start_time'], '%H:%M')
         end = datetime.strptime(rule['end_time'], '%H:%M')
         interval = timedelta(minutes=rule['interval_minutes'])
         
+        priority = schedule_manager._get_priority(patient_type)
         current = start
+        
+        # 先检查该患者当天是否已安排
+        existing_patient = chair_manager.db.execute('''
+            SELECT id FROM schedules 
+            WHERE chair_id=? AND schedule_date=? AND patient_id=? AND status='booked'
+        ''', (rule['chair_id'], schedule_date.isoformat(), patient_id)).fetchone()
+        if existing_patient:
+            return 'exists'
+        
+        # 遍历所有时段，只占用第一个可用的时段
+        booked_any = False
         while current < end:
             slot_end = current + interval
+            start_str = current.strftime('%H:%M')
+            end_str = slot_end.strftime('%H:%M')
             
             cursor = chair_manager.db.execute('''
-                SELECT id FROM schedules 
+                SELECT id, status, patient_id FROM schedules 
                 WHERE chair_id=? AND schedule_date=? AND start_time=?
-            ''', (rule['chair_id'], schedule_date.isoformat(), current.strftime('%H:%M')))
+            ''', (rule['chair_id'], schedule_date.isoformat(), start_str))
             
             existing = cursor.fetchone()
             
             if existing:
-                chair_manager.db.execute('''
-                    UPDATE schedules 
-                    SET patient_id=?, status='booked', patient_type=?, priority=?
-                    WHERE id=?
-                ''', (patient_id, patient_type, 
-                      schedule_manager._get_priority(patient_type), existing['id']))
+                if existing['status'] == 'available' and not booked_any:
+                    chair_manager.db.execute('''
+                        UPDATE schedules 
+                        SET patient_id=?, status='booked', patient_type=?, priority=?
+                        WHERE id=?
+                    ''', (patient_id, patient_type, priority, existing['id']))
+                    booked_any = True
+                    break
             else:
-                chair_manager.db.execute('''
-                    INSERT INTO schedules 
-                    (chair_id, patient_id, schedule_date, start_time, end_time, 
-                     status, patient_type, priority, cycle_rule_id)
-                    VALUES (?, ?, ?, ?, ?, 'booked', ?, ?, ?)
-                ''', (
-                    rule['chair_id'], patient_id, schedule_date.isoformat(),
-                    current.strftime('%H:%M'), slot_end.strftime('%H:%M'),
-                    patient_type, schedule_manager._get_priority(patient_type),
-                    rule['id']
-                ))
+                if not booked_any:
+                    chair_manager.db.execute('''
+                        INSERT INTO schedules 
+                        (chair_id, patient_id, schedule_date, start_time, end_time, 
+                         status, patient_type, priority, cycle_rule_id)
+                        VALUES (?, ?, ?, ?, ?, 'booked', ?, ?, ?)
+                    ''', (
+                        rule['chair_id'], patient_id, schedule_date.isoformat(),
+                        start_str, end_str,
+                        patient_type, priority, rule['id']
+                    ))
+                    booked_any = True
+                    break
             
             current = slot_end
+        
+        if booked_any:
+            return 'booked'
+        else:
+            return 'full'
     
     def load_patients_to_combo(self):
         current_data = self.patient_filter_combo.currentData()

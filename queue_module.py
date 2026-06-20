@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, 
     QTableWidgetItem, QDialog, QFormLayout, QLineEdit, QComboBox,
-    QSpinBox, QMessageBox, QLabel, QHeaderView,
+    QSpinBox, QMessageBox, QLabel, QHeaderView, QCheckBox,
     QTabWidget, QGroupBox, QListWidget, QListWidgetItem,
     QSplitter, QFrame, QGridLayout, QLCDNumber, QProgressBar
 )

@@ -64,8 +64,12 @@ class Database:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chair_id) REFERENCES chairs(id),
                 FOREIGN KEY (patient_id) REFERENCES patients(id),
-                FOREIGN KEY (cycle_rule_id) REFERENCES cycle_rules(id)
+                FOREIGN KEY (cycle_rule_id) REFERENCES cycle_rules(id),
+                UNIQUE(chair_id, schedule_date, start_time)
             );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_unique 
+            ON schedules(chair_id, schedule_date, start_time);
 
             CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,35 +293,40 @@ class ScheduleManager:
         self.db = db
 
     def generate_cycle_schedules(self, rule_id: int, start_date: date, 
-                                 end_date: date, patient_id: Optional[int] = None) -> int:
+                                 end_date: date, patient_id: Optional[int] = None) -> Tuple[int, int]:
         rule = CycleRuleManager(self.db).get_rule(rule_id)
         if not rule:
-            return 0
+            return (0, 0)
 
-        count = 0
+        added_count = 0
+        total_count = 0
         current_date = start_date
         
         while current_date <= end_date:
             if current_date.weekday() == rule['day_of_week']:
-                self._generate_daily_schedules(rule, current_date, patient_id)
-                count += 1
+                added, total = self._generate_daily_schedules(rule, current_date, patient_id)
+                added_count += added
+                total_count += total
             current_date += timedelta(days=1)
         
         self.db.commit()
-        return count
+        return (added_count, total_count)
 
     def _generate_daily_schedules(self, rule: Dict, schedule_date: date, 
-                                   patient_id: Optional[int]):
+                                   patient_id: Optional[int]) -> Tuple[int, int]:
         start = datetime.strptime(rule['start_time'], '%H:%M')
         end = datetime.strptime(rule['end_time'], '%H:%M')
         interval = timedelta(minutes=rule['interval_minutes'])
         
+        added_count = 0
+        total_count = 0
         current = start
         while current < end:
             slot_end = current + interval
             status = 'booked' if patient_id else 'available'
+            total_count += 1
             
-            self.db.execute('''
+            cursor = self.db.execute('''
                 INSERT OR IGNORE INTO schedules 
                 (chair_id, patient_id, schedule_date, start_time, end_time, 
                  status, patient_type, priority, cycle_rule_id)
@@ -333,7 +342,10 @@ class ScheduleManager:
                 self._get_priority(rule['patient_type']),
                 rule['id']
             ))
+            if cursor.rowcount > 0:
+                added_count += 1
             current = slot_end
+        return (added_count, total_count)
 
     def _get_priority(self, patient_type: str) -> int:
         cursor = self.db.execute(
@@ -346,30 +358,35 @@ class ScheduleManager:
     def generate_batch_schedules(self, chair_id: int, start_date: date, 
                                   end_date: date, day_of_week: int,
                                   start_time: str, end_time: str,
-                                  interval_minutes: int = 30) -> int:
-        count = 0
+                                  interval_minutes: int = 30) -> Tuple[int, int]:
+        added_count = 0
+        total_count = 0
         current_date = start_date
         
         while current_date <= end_date:
             if current_date.weekday() == day_of_week:
-                self._generate_day_slots(chair_id, current_date, start_time, 
-                                          end_time, interval_minutes)
-                count += 1
+                added, total = self._generate_day_slots(chair_id, current_date, start_time, 
+                                                          end_time, interval_minutes)
+                added_count += added
+                total_count += total
             current_date += timedelta(days=1)
         
         self.db.commit()
-        return count
+        return (added_count, total_count)
 
     def _generate_day_slots(self, chair_id: int, schedule_date: date,
-                            start_time: str, end_time: str, interval_minutes: int):
+                            start_time: str, end_time: str, interval_minutes: int) -> Tuple[int, int]:
         start = datetime.strptime(start_time, '%H:%M')
         end = datetime.strptime(end_time, '%H:%M')
         interval = timedelta(minutes=interval_minutes)
         
+        added_count = 0
+        total_count = 0
         current = start
         while current < end:
             slot_end = current + interval
-            self.db.execute('''
+            total_count += 1
+            cursor = self.db.execute('''
                 INSERT OR IGNORE INTO schedules 
                 (chair_id, schedule_date, start_time, end_time, status)
                 VALUES (?, ?, ?, ?, 'available')
@@ -379,7 +396,10 @@ class ScheduleManager:
                 current.strftime('%H:%M'),
                 slot_end.strftime('%H:%M')
             ))
+            if cursor.rowcount > 0:
+                added_count += 1
             current = slot_end
+        return (added_count, total_count)
 
     def book_schedule(self, schedule_id: int, patient_id: int, 
                       patient_type: str = "normal") -> bool:
